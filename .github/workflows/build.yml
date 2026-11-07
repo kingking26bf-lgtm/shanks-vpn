@@ -2,8 +2,10 @@
         uses: actions/upload-artifact@v4
         with:
           name: SHANKS-TUNNING-APK
-          path: project/**/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          path: |
+            **/build/outputs/apk/debug/*.apk
+            **/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
 
 on:
   push:
