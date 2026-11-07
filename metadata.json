@@ -1,0 +1,6 @@
+{
+  "name": "SHANKS VPN",
+  "description": "Application Android de gestion et connexion VPN haute performance : VLESS, VMess, Trojan, SlowDNS et fichiers d'injection (.hc, .ehi, .hat, .dark, .npv, .ssc).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

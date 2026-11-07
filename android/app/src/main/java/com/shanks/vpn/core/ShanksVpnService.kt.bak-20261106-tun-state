@@ -1,0 +1,337 @@
+package com.shanks.vpn.core
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import androidx.core.app.NotificationCompat
+import android.net.ProxyInfo
+import android.net.VpnService
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import android.content.pm.PackageManager.NameNotFoundException
+import android.util.Log
+import com.shanks.vpn.LibboxInitializer
+import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.TunOptions
+
+class ShanksVpnService : VpnService() {
+
+    companion object {
+        private const val TAG = "ShanksVpnService"
+        const val ACTION_START = "com.shanks.vpn.START"
+        const val ACTION_STOP = "com.shanks.vpn.STOP"
+        const val EXTRA_CONFIG = "vpn_config"
+        const val ACTION_STATE = "com.shanks.vpn.STATE"
+        const val EXTRA_STATE = "vpn_state"
+        const val EXTRA_MESSAGE = "vpn_message"
+        private const val CHANNEL_ID = "shanks_vpn_status"
+        private const val NOTIFICATION_ID = 1001
+    }
+
+
+    private fun reportState(state: String, message: String? = null) {
+        val event = Intent(ACTION_STATE).setPackage(packageName)
+        event.putExtra(EXTRA_STATE, state)
+        if (message != null) event.putExtra(EXTRA_MESSAGE, message)
+        sendBroadcast(event)
+        Log.i(TAG, "État VPN : $state")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopEngine()
+                reportState("DISCONNECTED")
+                stopForeground(true)
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+
+            ACTION_START -> {
+                reportState("CONNECTING")
+                val config = intent.getStringExtra(EXTRA_CONFIG)
+                if (config.isNullOrBlank()) {
+                    Log.e(TAG, "Configuration absente")
+                    reportState("ERROR", "Configuration VPN absente")
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
+
+                try {
+                    showForegroundNotification()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Impossible de démarrer la notification VPN", e)
+                    reportState("ERROR", e.message ?: "Notification VPN impossible")
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
+
+                Thread {
+                    try {
+                        startEngine(config)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Démarrage VPN impossible", e)
+                        stopEngine()
+                        reportState("ERROR", e.message ?: "Démarrage Libbox impossible")
+                        stopSelf(startId)
+                    }
+                }.start()
+            }
+
+            else -> {
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+        }
+
+        return START_NOT_STICKY
+    }
+
+    private fun showForegroundNotification() {
+        val manager = getSystemService(NotificationManager::class.java)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "État de SHANKS VPN",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            manager.createNotificationChannel(channel)
+        }
+
+        val notification: Notification =
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentTitle("SHANKS VPN")
+                .setContentText("Service VPN en cours")
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .build()
+
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private var tunnel: ParcelFileDescriptor? = null
+    private var commandServer: CommandServer? = null
+    private var currentConfig: String? = null
+
+    @Synchronized
+    fun startEngine(config: String) {
+        require(config.isNotBlank()) {
+            "Configuration VPN vide"
+        }
+        check(VpnService.prepare(this) == null) {
+            "Autorisation VPN Android manquante"
+        }
+
+        try {
+            LibboxInitializer.initialize(this)
+            Libbox.checkConfig(config)
+            Log.i(TAG, "Configuration sing-box validée")
+
+            if (commandServer == null) {
+                val handler = ShanksCommandServerHandler(
+                    onReload = {
+                        currentConfig?.let { reloadEngine(it) }
+                    },
+                    onStop = {
+                        stopEngine()
+                    }
+                )
+
+                commandServer = CommandServer(
+                    handler,
+                    ShanksPlatformInterface(this)
+                )
+
+                commandServer!!.start()
+            }
+
+            currentConfig = config
+
+            commandServer!!.startOrReloadService(
+                config,
+                OverrideOptions()
+            )
+
+            check(tunnel != null) {
+                "Libbox n'a pas encore établi le tunnel TUN"
+            }
+            Log.i(TAG, "Commande de démarrage transmise à libbox")
+            reportState("CONNECTED")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Échec du démarrage libbox", e)
+            stopEngine()
+            throw e
+        }
+    }
+
+    @Synchronized
+    fun reloadEngine(config: String) {
+        startEngine(config)
+    }
+
+    @Synchronized
+    fun stopEngine() {
+        val server = commandServer
+
+        try {
+            tunnel?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Erreur fermeture TUN", e)
+        } finally {
+            tunnel = null
+        }
+
+        if (server != null) {
+            try {
+                server.closeService()
+            } catch (e: Exception) {
+                Log.e(TAG, "Erreur closeService", e)
+            }
+
+            try {
+                server.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Erreur fermeture CommandServer", e)
+            }
+        }
+
+        commandServer = null
+        currentConfig = null
+        Log.i(TAG, "Moteur libbox arrêté")
+    }
+
+    fun establishTun(options: TunOptions): Int {
+        check(VpnService.prepare(this) == null) {
+            "Autorisation VPN Android manquante"
+        }
+
+        tunnel?.close()
+        tunnel = null
+
+        val builder = Builder()
+            .setSession("SHANKS VPN")
+            .setMtu(options.mtu)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.setMetered(false)
+        }
+
+        val ipv4 = options.inet4Address
+        while (ipv4.hasNext()) {
+            val address = ipv4.next()
+            builder.addAddress(address.address(), address.prefix())
+        }
+
+        val ipv6 = options.inet6Address
+        while (ipv6.hasNext()) {
+            val address = ipv6.next()
+            builder.addAddress(address.address(), address.prefix())
+        }
+
+        if (options.autoRoute) {
+            val dns = options.dnsServerAddress
+            while (dns.hasNext()) {
+                builder.addDnsServer(dns.next())
+            }
+
+            val routes4 = options.inet4RouteAddress
+            if (routes4.hasNext()) {
+                while (routes4.hasNext()) {
+                    val route = routes4.next()
+                    builder.addRoute(route.address(), route.prefix())
+                }
+            } else {
+                val ranges4 = options.inet4RouteRange
+                while (ranges4.hasNext()) {
+                    val route = ranges4.next()
+                    builder.addRoute(route.address(), route.prefix())
+                }
+            }
+
+            val routes6 = options.inet6RouteAddress
+            if (routes6.hasNext()) {
+                while (routes6.hasNext()) {
+                    val route = routes6.next()
+                    builder.addRoute(route.address(), route.prefix())
+                }
+            } else {
+                val ranges6 = options.inet6RouteRange
+                while (ranges6.hasNext()) {
+                    val route = ranges6.next()
+                    builder.addRoute(route.address(), route.prefix())
+                }
+            }
+        }
+
+        val included = options.includePackage
+        while (included.hasNext()) {
+            val packageName = included.next()
+            try {
+                builder.addAllowedApplication(packageName)
+            } catch (e: NameNotFoundException) {
+                Log.e(TAG, "Application autorisée introuvable : $packageName", e)
+            }
+        }
+
+        val excluded = options.excludePackage
+        while (excluded.hasNext()) {
+            val packageName = excluded.next()
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (e: NameNotFoundException) {
+                Log.e(TAG, "Application exclue introuvable : $packageName", e)
+            }
+        }
+
+        if (
+            options.isHTTPProxyEnabled &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            options.httpProxyServer.isNotBlank()
+        ) {
+            builder.setHttpProxy(
+                ProxyInfo.buildDirectProxy(
+                    options.httpProxyServer,
+                    options.httpProxyServerPort
+                )
+            )
+        }
+
+        val descriptor = builder.establish()
+            ?: throw IllegalStateException(
+                "Android n'a pas pu établir le tunnel VPN"
+            )
+
+        tunnel = descriptor
+        Log.i(TAG, "Descripteur TUN Android établi")
+
+        return descriptor.fd
+    }
+
+    override fun onRevoke() {
+        stopEngine()
+        reportState("DISCONNECTED", "Autorisation VPN révoquée")
+        stopSelf()
+        super.onRevoke()
+    }
+
+    override fun onDestroy() {
+        stopEngine()
+        super.onDestroy()
+    }
+}

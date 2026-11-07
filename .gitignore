@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Fichiers Android locaux et secrets
+local.properties
+.gradle/
+google-services.json
+*.jks
+*.keystore
