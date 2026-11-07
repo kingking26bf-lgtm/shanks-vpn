@@ -1,0 +1,38 @@
+name: Construire l’APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Décompresser le projet
+        run: unzip -q shanks-tunning-android.zip
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Construire l’APK
+        run: |
+          cd shanks
+          gradle assembleDebug
+
+      - name: Publier l’APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0
+          files: shanks/app/build/outputs/apk/debug/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
